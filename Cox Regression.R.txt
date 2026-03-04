@@ -1,0 +1,1317 @@
+# =============================================================================
+# 中老年抑郁患者握力变化与心血管疾病的关联分析
+# 时变系数 COX 模型（含 PH 检验 + 自动添加交互项）
+# 修正说明：将所有数值结果列转换为字符型，解决 bind_rows 类型不匹配错误
+# 新增：抑郁亚组内握力四分位数比较的 Bonferroni 及 FDR 多重比较校正
+# 新增：加法交互作用检验（RERI, AP, S）
+# 新增：输出各模型暴露组样本量与事件数（描述性统计）
+# 新增：Grip strength changes 连续变量分析（整体 + 抑郁亚组）
+# =============================================================================
+
+# 安装并加载所需包
+if (!require("survival")) install.packages("survival")
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("openxlsx")) install.packages("openxlsx")
+if (!require("stringr")) install.packages("stringr")
+if (!require("tidyr")) install.packages("tidyr")
+if (!require("boot")) install.packages("boot")   # 用于Bootstrap
+
+library(survival)
+library(dplyr)
+library(openxlsx)
+library(stringr)
+library(tidyr)
+library(boot)
+
+# 全局设置，避免因子自动转换为字符串
+options(stringsAsFactors = FALSE)
+
+# =============================================================================
+# 0. 工具函数：Windows文件名安全化（替换非法字符）
+# =============================================================================
+safe_filename <- function(s) {
+  s <- as.character(s)
+  s <- gsub("<", "_lt_", s)
+  s <- gsub(">", "_gt_", s)
+  s <- gsub("≥", "_ge_", s)
+  s <- gsub("≤", "_le_", s)
+  s <- gsub('[<>:"/\\\\|?*]', "_", s)
+  return(s)
+}
+
+# 辅助函数：处理变量名中的特殊字符（如连字符）以便在公式中使用
+safe_var <- function(x) {
+  if (grepl("-", x)) {
+    return(paste0("`", x, "`"))
+  } else {
+    return(x)
+  }
+}
+
+# 辅助函数：从cox.zph结果中提取违反PH的原始变量名
+get_violate_vars <- function(zph, all_vars) {
+  tbl <- zph$table
+  vars_raw <- rownames(tbl)
+  violate <- c()
+  for (i in seq_along(vars_raw)) {
+    vr <- vars_raw[i]
+    if (vr == "GLOBAL") next
+    p <- tbl[i, "p"]
+    if (p >= 0.05) next
+    # 尝试提取基础变量名（去除可能的数字后缀和反引号）
+    v_clean <- gsub("^`|`$", "", vr)
+    # 如果是因子水平，如 "factor2"，尝试去掉末尾数字
+    v_base <- gsub("[0-9]+$", "", v_clean)
+    if (v_base %in% all_vars) {
+      if (!(v_base %in% violate)) violate <- c(violate, v_base)
+    } else {
+      # 否则直接使用原始变量名（可能是连续变量或无法识别的）
+      if (!(v_clean %in% violate)) violate <- c(violate, v_clean)
+    }
+  }
+  return(violate)
+}
+
+# =============================================================================
+# 1. 初始化设置与路径配置
+# =============================================================================
+data_dir <- "D:/中老年抑郁患者握力变化与心血管疾病的关联/筛选数据/未处理异常值主分析"
+data_file <- "插补后数据.xlsx"
+data_path <- file.path(data_dir, data_file)
+
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+result_dir <- file.path(data_dir, paste0("时变COX分析结果_", timestamp))
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =============================================================================
+# 2. 变量定义（根据实际数据列名调整）
+# =============================================================================
+# 自变量1 - Grip strength changes（使用全样本四分位数）
+independent_vars <- "Grip.strength.changes"
+
+# 自变量2 - Depression change（单独分析用，四分类）
+depression_ind_var <- "Depression.change"
+
+# 因变量和时间变量
+time_var <- "time"
+event_var <- "CVD"
+
+# 协变量（注意：包含连字符的变量需特殊处理）
+categorical_vars <- c("Sex", "Education", "Marital.status", "Smoking", "Drinking",
+                      "Social.activity")   # 已删除 Physical.activity
+continuous_vars <- c("TC", "HDL-C", "HbA1c", "CRP", "Age", "Height",
+                     "Weight", "Baseline.grip.strength", "SBP")
+layer2_covariates <- c(categorical_vars, continuous_vars)
+
+# 所有可能出现在模型中的变量（用于PH检验中识别基础变量名）
+all_model_vars <- c("grip_quartile", depression_ind_var, layer2_covariates)
+
+# 分层（两层）
+layers <- list(
+  "第一层(未调整)" = character(0),
+  "第二层(完全调整)" = layer2_covariates
+)
+
+# 抑郁亚组编码说明
+depression_subgroup_labels <- c(
+  "1" = "持续无抑郁",
+  "2" = "抑郁缓解",
+  "3" = "持续抑郁",
+  "4" = "新发抑郁"
+)
+depression_subgroups <- c(1, 2, 3, 4)
+
+# =============================================================================
+# 3. 数据读取与预处理
+# =============================================================================
+cat(rep("=", 60), "\n")
+cat("开始时变COX回归分析 -", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+cat("数据路径:", data_path, "\n")
+cat("结果保存至:", result_dir, "\n")
+cat("握力分析自变量:", independent_vars, "(整体四分位数 + 连续)\n")
+cat("抑郁单独分析自变量:", depression_ind_var, "(四分类，1为参考组)\n")
+cat("因变量:", event_var, "\n")
+cat("时间变量:", time_var, "\n")
+cat("分类协变量:", paste(categorical_vars, collapse = ", "), "\n")
+cat("连续协变量:", paste(continuous_vars, collapse = ", "), "\n")
+cat(rep("=", 60), "\n")
+
+# 读取数据
+data <- read.xlsx(data_path)
+cat("成功读取数据，样本量:", nrow(data), "\n")
+
+# 检查必需变量
+required_vars <- c(independent_vars, depression_ind_var, time_var, event_var, layer2_covariates)
+missing_vars <- setdiff(required_vars, names(data))
+if (length(missing_vars) > 0) {
+  cat("警告: 以下变量在数据中不存在:", paste(missing_vars, collapse = ", "), "\n")
+  cat("数据中的列名(前30):\n")
+  print(head(names(data), 30))
+  stop("缺失变量: ", paste(missing_vars, collapse = ", "))
+} else {
+  cat("✅ 所有必需变量都存在\n")
+}
+
+# 抑郁分布 & 过滤异常编码
+depression_counts <- table(data[[depression_ind_var]])
+cat("\n", depression_ind_var, "（抑郁变化）分布:\n")
+for (code in depression_subgroups) {
+  count <- ifelse(code %in% names(depression_counts), depression_counts[as.character(code)], 0)
+  percent <- count / nrow(data) * 100
+  label <- depression_subgroup_labels[as.character(code)]
+  cat(" ", label, "(编码", code, "):", count, "人 (", round(percent, 1), "%)\n")
+}
+
+data <- data[data[[depression_ind_var]] %in% depression_subgroups, ]
+cat("过滤后有效样本量:", nrow(data), "\n")
+
+# ---------------- 分类变量处理 ----------------
+cat("\n正在处理分类变量...\n")
+
+# Sex: 1/2 -> factor
+if ("Sex" %in% names(data)) {
+  sex_counts <- table(data$Sex)
+  cat("Sex分布:", paste(names(sex_counts), sex_counts, sep = "=", collapse = ", "), "\n")
+  data$Sex <- factor(data$Sex, levels = c(1, 2), labels = c("Male", "Female"))
+  cat("Sex已转换为分类变量，男性(1)为参考组\n")
+}
+
+# Education: 合并 2/3 为 2（高中及以上）
+if ("Education" %in% names(data)) {
+  edu_counts <- table(data$Education)
+  cat("Education原始分布:", paste(names(edu_counts), edu_counts, sep = "=", collapse = ", "), "\n")
+  data$Education_binary <- data$Education
+  data$Education_binary[data$Education_binary %in% c(2, 3)] <- 2
+  edu_binary_counts <- table(data$Education_binary)
+  cat("Education合并后分布:", paste(names(edu_binary_counts), edu_binary_counts, sep = "=", collapse = ", "), "\n")
+  data$Education <- factor(data$Education_binary, levels = c(1, 2), labels = c("Below high school", "High school及以上"))
+  data$Education_binary <- NULL
+  cat("Education已转换为二分类变量，高中以下为参考组\n")
+}
+
+# 其他二分类变量 0/1 -> factor
+binary_vars <- c("Marital.status", "Smoking", "Drinking", "Social.activity")   # 已删除 Physical.activity
+for (var in binary_vars) {
+  if (var %in% names(data)) {
+    var_counts <- table(data[[var]])
+    cat(var, "分布:", paste(names(var_counts), var_counts, sep = "=", collapse = ", "), "\n")
+    uniq_vals <- unique(na.omit(data[[var]]))
+    if (all(uniq_vals %in% c(0, 1))) {
+      data[[var]] <- factor(data[[var]], levels = c(0, 1), labels = c("No", "Yes"))
+      cat(var, "已转换为分类变量，0为参考组\n")
+    } else {
+      cat("⚠️ 警告:", var, "包含非0/1值:", paste(uniq_vals, collapse = ", "), "\n")
+    }
+  }
+}
+
+# 抑郁变化变量 -> factor（1为参考）
+data[[depression_ind_var]] <- factor(data[[depression_ind_var]],
+                                     levels = depression_subgroups,
+                                     labels = depression_subgroup_labels[as.character(depression_subgroups)])
+cat("\n", depression_ind_var, "已转换为分类变量，", depression_subgroup_labels["1"], "（编码1）为参考组\n")
+
+# 时间/事件基本信息
+cat("\n时间变量 '", time_var, "' 的统计信息:\n")
+print(summary(data[[time_var]]))
+
+cat("\n事件变量 '", event_var, "' 的分布:\n")
+event_counts <- table(data[[event_var]])
+print(event_counts)
+event_rate <- ifelse("1" %in% names(event_counts), event_counts["1"] / nrow(data) * 100, 0)
+cat("事件发生率:", round(event_rate, 2), "%\n")
+
+# ---------------- 关键：全样本四分位数（用于所有亚组） ----------------
+cat("\n自变量 '", independent_vars, "' 的统计信息（整体）:\n")
+print(summary(data[[independent_vars]]))
+
+q_vals <- quantile(data[[independent_vars]], probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+cat("\n", independent_vars, "（整体）的四分位数:\n")
+cat("Q1 (25%):", round(q_vals[1], 3), "\n")
+cat("Q2 (中位数):", round(q_vals[2], 3), "\n")
+cat("Q3 (75%):", round(q_vals[3], 3), "\n")
+
+# 使用全样本四分位数进行划分（确保所有亚组使用相同的切点）
+breaks <- c(-Inf, q_vals[1], q_vals[2], q_vals[3], Inf)
+labels <- c("Q1", "Q2", "Q3", "Q4")
+data$grip_quartile <- cut(data[[independent_vars]], breaks = breaks, labels = labels, include.lowest = TRUE, right = TRUE)
+# 检查分布
+quartile_counts <- table(data$grip_quartile)
+cat("\n", independent_vars, "四分位数分布（整体）:\n")
+for (lev in labels) {
+  cnt <- quartile_counts[lev]
+  pct <- cnt / nrow(data) * 100
+  cat(" ", lev, ":", cnt, "人 (", round(pct, 2), "%)\n")
+}
+# 转换为无序因子（参考组为Q1）
+data$grip_quartile <- factor(data$grip_quartile, levels = labels, ordered = FALSE)
+
+# =============================================================================
+# 4. 全局结果容器（主效应、交互项、PH检验、描述统计）
+# =============================================================================
+global_main_list <- list()        # 主效应结果汇总
+global_interaction_list <- list() # 交互项结果汇总
+global_ph_list <- list()          # PH假设检验结果汇总
+global_desc_list <- list()         # 新增：各模型暴露组描述性统计
+
+# =============================================================================
+# 5. 函数1：握力四分位数（整体 + 抑郁亚组）- 时变系数版本
+# =============================================================================
+run_tvcox_analysis_subgroup <- function(ind_var, event_var, time_var, dep_code = NULL) {
+  # 分析名称
+  if (is.null(dep_code)) {
+    analysis_name <- "整体分析"
+    subgroup_type <- "抑郁变化"
+    subgroup_name <- "整体"
+  } else {
+    dep_label <- depression_subgroup_labels[as.character(dep_code)]
+    analysis_name <- paste0("抑郁亚组", dep_code, "（", dep_label, "）分析")
+    subgroup_type <- "抑郁变化"
+    subgroup_name <- dep_label
+  }
+  
+  analysis_tag_raw <- paste0(analysis_name, "_", ind_var, "_四分位数_vs_", event_var)
+  analysis_tag <- safe_filename(analysis_tag_raw)
+  main_path <- file.path(result_dir, paste0(analysis_tag, "_主效应表.xlsx"))
+  inter_path <- file.path(result_dir, paste0(analysis_tag, "_交互项表.xlsx"))
+  
+  cat("\n", rep("#", 80), "\n")
+  cat("开始时变COX分析:", analysis_name, "\n")
+  cat("自变量=", ind_var, "(全样本四分位数), 参考=Q1, 事件=", event_var, ", 时间=", time_var, "\n")
+  cat(rep("#", 80), "\n")
+  
+  base_info <- list(
+    分析类型 = analysis_name,
+    亚组类型 = subgroup_type,
+    亚组名称 = subgroup_name,
+    自变量 = paste0(ind_var, "_全样本四分位数(Q1参考)"),
+    因变量 = event_var,
+    时间变量 = time_var
+  )
+  
+  # 准备数据
+  all_vars <- c("grip_quartile", time_var, event_var, depression_ind_var, layer2_covariates)
+  model_data <- data[, all_vars, drop = FALSE]
+  
+  # 抑郁亚组筛选
+  if (!is.null(dep_code)) {
+    model_data <- model_data[model_data[[depression_ind_var]] == depression_subgroup_labels[as.character(dep_code)], ]
+    cat("亚组筛选:", subgroup_name, "，样本量=", nrow(model_data), "\n")
+  } else {
+    cat("整体分析样本量:", nrow(model_data), "\n")
+  }
+  
+  # 删除缺失值
+  model_data <- na.omit(model_data)
+  cat("删除缺失值后有效样本量:", nrow(model_data), "\n")
+  
+  if (nrow(model_data) == 0) {
+    cat("⚠️ 有效样本量为0，跳过该分析\n")
+    return(NULL)
+  }
+  
+  event_cnt <- sum(model_data[[event_var]])
+  ev_rate <- event_cnt / nrow(model_data) * 100
+  cat("事件数:", event_cnt, "(", round(ev_rate, 1), "%)\n")
+  
+  # 时间中心化（用于交互项）
+  time_mean <- mean(model_data[[time_var]], na.rm = TRUE)
+  model_data$time_centered <- model_data[[time_var]] - time_mean
+  
+  # ===== 新增：计算暴露变量（握力四分位数）的描述性统计 =====
+  exposure_var <- "grip_quartile"
+  desc_base <- model_data %>%
+    group_by(!!sym(exposure_var)) %>%
+    summarise(
+      样本量 = n(),
+      事件数 = sum(!!sym(event_var))
+    ) %>%
+    mutate(
+      事件率 = round(事件数 / 样本量 * 100, 2),
+      分析类型 = analysis_name,
+      亚组类型 = subgroup_type,
+      亚组名称 = subgroup_name
+    ) %>%
+    ungroup() %>%
+    rename(变量水平 = !!sym(exposure_var))
+  
+  # 遍历每一层
+  for (layer_name in names(layers)) {
+    covariates <- layers[[layer_name]]
+    cat("\n【", layer_name, "】\n")
+    
+    # ===== 新增：为当前层复制描述统计并存入全局列表 =====
+    desc_layer <- desc_base %>%
+      mutate(
+        分层 = layer_name,
+        调整模型 = layer_name
+      )
+    global_desc_list <<- append(global_desc_list, list(desc_layer))
+    
+    # 构建标准模型公式（用于PH检验）
+    if (length(covariates) > 0) {
+      cov_part <- paste(sapply(covariates, safe_var), collapse = " + ")
+      formula_std <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ grip_quartile + ", cov_part))
+    } else {
+      formula_std <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ grip_quartile"))
+    }
+    
+    # 拟合标准模型
+    fit_std <- tryCatch(coxph(formula_std, data = model_data), error = function(e) NULL)
+    if (is.null(fit_std)) {
+      cat("标准模型拟合失败，跳过该层\n")
+      next
+    }
+    
+    # ---------- PH 检验 ----------
+    zph <- cox.zph(fit_std)
+    # 保存PH检验结果
+    zph_df <- as.data.frame(zph$table)
+    zph_df$variable <- rownames(zph_df)
+    rownames(zph_df) <- NULL
+    zph_df <- cbind(
+      data.frame(
+        分析类型 = analysis_name,
+        亚组类型 = subgroup_type,
+        亚组名称 = subgroup_name,
+        分层 = layer_name,
+        调整模型 = layer_name,
+        有效样本量 = nrow(model_data),
+        事件数 = event_cnt,
+        stringsAsFactors = FALSE
+      ),
+      zph_df[, c("variable", "chisq", "df", "p")]
+    )
+    names(zph_df)[names(zph_df) == "chisq"] <- "卡方值"
+    names(zph_df)[names(zph_df) == "df"] <- "自由度"
+    names(zph_df)[names(zph_df) == "p"] <- "P值"
+    zph_df$是否满足PH假设 <- ifelse(zph_df$P值 > 0.05, "是", "否")
+    global_ph_list <<- append(global_ph_list, list(zph_df))
+    
+    # 确定需要加交互项的变量
+    violate_vars <- get_violate_vars(zph, all_model_vars)
+    cat("违反PH的变量:", paste(violate_vars, collapse = ", "), "\n")
+    
+    # ---------- 构建时变模型 ----------
+    # 主效应部分与标准模型相同
+    main_terms <- c("grip_quartile", covariates)
+    # 交互项部分：对每个违反的变量添加 :time_centered
+    inter_terms <- c()
+    for (vv in violate_vars) {
+      inter_terms <- c(inter_terms, paste0(safe_var(vv), ":time_centered"))
+    }
+    
+    all_terms <- c(sapply(main_terms, safe_var), inter_terms)
+    formula_tv <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ ", 
+                                   paste(all_terms, collapse = " + ")))
+    
+    fit_tv <- tryCatch(coxph(formula_tv, data = model_data), error = function(e) NULL)
+    if (is.null(fit_tv)) {
+      cat("时变模型拟合失败，跳过该层\n")
+      next
+    }
+    
+    # ---------- 提取主效应结果 ----------
+    s_tv <- summary(fit_tv)
+    coef_mat <- s_tv$coefficients
+    # 提取 grip_quartile 的主效应（不含交互项的行）
+    main_rows <- list()
+    # 参考组
+    main_rows <- append(main_rows, list(data.frame(
+      分层 = layer_name,
+      变量 = "Q1 (参考组)",
+      HR = "1.000",
+      HR_95CI_下限 = "-",
+      HR_95CI_上限 = "-",
+      HR_95CI = "-",
+      P值 = "-",
+      显著性 = "-",
+      系数 = "-",
+      标准误 = "-",
+      stringsAsFactors = FALSE
+    )))
+    # 其他水平
+    q_levels <- setdiff(labels, "Q1")
+    for (qlev in q_levels) {
+      term <- paste0("grip_quartile", qlev)
+      if (term %in% rownames(coef_mat)) {
+        idx <- which(rownames(coef_mat) == term)
+        coef <- coef_mat[idx, "coef"]
+        se <- coef_mat[idx, "se(coef)"]
+        p <- coef_mat[idx, "Pr(>|z|)"]
+        hr <- exp(coef)
+        ci_l <- exp(coef - 1.96 * se)
+        ci_u <- exp(coef + 1.96 * se)
+        sig <- ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "")))
+        # 转换为字符型
+        main_rows <- append(main_rows, list(data.frame(
+          分层 = layer_name,
+          变量 = paste0(qlev, " (vs Q1)"),
+          HR = as.character(round(hr, 3)),
+          HR_95CI_下限 = as.character(round(ci_l, 3)),
+          HR_95CI_上限 = as.character(round(ci_u, 3)),
+          HR_95CI = paste0(round(ci_l, 3), "-", round(ci_u, 3)),
+          P值 = as.character(round(p, 4)),
+          显著性 = sig,
+          系数 = as.character(round(coef, 4)),
+          标准误 = as.character(round(se, 4)),
+          stringsAsFactors = FALSE
+        )))
+      }
+    }
+    # 添加基础信息并存入全局
+    if (length(main_rows) > 0) {
+      main_df <- bind_rows(main_rows)
+      main_df <- cbind(
+        data.frame(
+          分析类型 = analysis_name,
+          亚组类型 = subgroup_type,
+          亚组名称 = subgroup_name,
+          分层 = layer_name,
+          调整模型 = layer_name,
+          有效样本量 = nrow(model_data),
+          事件数 = event_cnt,
+          stringsAsFactors = FALSE
+        ),
+        main_df
+      )
+      global_main_list <<- append(global_main_list, list(main_df))
+    }
+    
+    # ---------- 提取交互项结果 ----------
+    inter_rows <- list()
+    inter_terms_in_model <- grep(":time_centered", rownames(coef_mat), value = TRUE)
+    for (iterm in inter_terms_in_model) {
+      idx <- which(rownames(coef_mat) == iterm)
+      coef <- coef_mat[idx, "coef"]
+      se <- coef_mat[idx, "se(coef)"]
+      p <- coef_mat[idx, "Pr(>|z|)"]
+      hr <- exp(coef)
+      ci_l <- exp(coef - 1.96 * se)
+      ci_u <- exp(coef + 1.96 * se)
+      sig <- ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "")))
+      # 变量名美化
+      var_show <- gsub(":time_centered", "", iterm)
+      var_show <- gsub("^`|`$", "", var_show)
+      # 转换为字符型
+      inter_rows <- append(inter_rows, list(data.frame(
+        分层 = layer_name,
+        变量 = paste0(var_show, " × 时间(中心化)"),
+        HR = as.character(round(hr, 3)),
+        HR_95CI_下限 = as.character(round(ci_l, 3)),
+        HR_95CI_上限 = as.character(round(ci_u, 3)),
+        HR_95CI = paste0(round(ci_l, 3), "-", round(ci_u, 3)),
+        P值 = as.character(round(p, 4)),
+        显著性 = sig,
+        系数 = as.character(round(coef, 4)),
+        标准误 = as.character(round(se, 4)),
+        stringsAsFactors = FALSE
+      )))
+    }
+    if (length(inter_rows) > 0) {
+      inter_df <- bind_rows(inter_rows)
+      inter_df <- cbind(
+        data.frame(
+          分析类型 = analysis_name,
+          亚组类型 = subgroup_type,
+          亚组名称 = subgroup_name,
+          分层 = layer_name,
+          调整模型 = layer_name,
+          有效样本量 = nrow(model_data),
+          事件数 = event_cnt,
+          stringsAsFactors = FALSE
+        ),
+        inter_df
+      )
+      global_interaction_list <<- append(global_interaction_list, list(inter_df))
+    }
+  } # 结束层循环
+}
+
+# =============================================================================
+# 6. 函数2：抑郁变化单独 COX（时变系数版本）
+# =============================================================================
+run_tvcox_depression_single <- function(ind_var, event_var, time_var) {
+  analysis_name <- paste0("Depression change单独COX分析（以", depression_subgroup_labels["1"], "为参考）")
+  analysis_tag <- safe_filename(paste0("单独分析_", ind_var, "_四分类_vs_", event_var))
+  main_path <- file.path(result_dir, paste0(analysis_tag, "_主效应表.xlsx"))
+  inter_path <- file.path(result_dir, paste0(analysis_tag, "_交互项表.xlsx"))
+  
+  cat("\n", rep("#", 80), "\n")
+  cat("开始时变COX分析:", analysis_name, "\n")
+  cat("自变量=", ind_var, "(四分类), 事件=", event_var, ", 时间=", time_var, "\n")
+  cat(rep("#", 80), "\n")
+  
+  base_info <- list(
+    分析类型 = analysis_name,
+    亚组类型 = "抑郁变化(单独)",
+    亚组名称 = "全样本",
+    自变量 = paste0(ind_var, "_四分类(1参考)"),
+    因变量 = event_var,
+    时间变量 = time_var
+  )
+  
+  all_vars <- c(ind_var, time_var, event_var, layer2_covariates)
+  model_data <- data[, all_vars, drop = FALSE]
+  model_data <- na.omit(model_data)
+  
+  if (nrow(model_data) == 0) {
+    cat("⚠️ 有效样本量为0，跳过该分析\n")
+    return(NULL)
+  }
+  
+  event_cnt <- sum(model_data[[event_var]])
+  ev_rate <- event_cnt / nrow(model_data) * 100
+  cat("有效样本量:", nrow(model_data), "；事件数:", event_cnt, "(", round(ev_rate, 1), "%)\n")
+  
+  # 时间中心化
+  time_mean <- mean(model_data[[time_var]], na.rm = TRUE)
+  model_data$time_centered <- model_data[[time_var]] - time_mean
+  
+  # ===== 新增：计算暴露变量（抑郁变化）的描述性统计 =====
+  exposure_var <- ind_var
+  desc_base <- model_data %>%
+    group_by(!!sym(exposure_var)) %>%
+    summarise(
+      样本量 = n(),
+      事件数 = sum(!!sym(event_var))
+    ) %>%
+    mutate(
+      事件率 = round(事件数 / 样本量 * 100, 2),
+      分析类型 = analysis_name,
+      亚组类型 = "抑郁变化(单独)",
+      亚组名称 = "全样本"
+    ) %>%
+    ungroup() %>%
+    rename(变量水平 = !!sym(exposure_var))
+  
+  for (layer_name in names(layers)) {
+    covariates <- layers[[layer_name]]
+    cat("\n【", layer_name, "】\n")
+    
+    # ===== 新增：为当前层复制描述统计并存入全局列表 =====
+    desc_layer <- desc_base %>%
+      mutate(
+        分层 = layer_name,
+        调整模型 = layer_name
+      )
+    global_desc_list <<- append(global_desc_list, list(desc_layer))
+    
+    # 构建标准模型
+    if (length(covariates) > 0) {
+      cov_part <- paste(sapply(covariates, safe_var), collapse = " + ")
+      formula_std <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ ", ind_var, " + ", cov_part))
+    } else {
+      formula_std <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ ", ind_var))
+    }
+    
+    fit_std <- tryCatch(coxph(formula_std, data = model_data), error = function(e) NULL)
+    if (is.null(fit_std)) {
+      cat("标准模型拟合失败，跳过该层\n")
+      next
+    }
+    
+    # PH 检验
+    zph <- cox.zph(fit_std)
+    zph_df <- as.data.frame(zph$table)
+    zph_df$variable <- rownames(zph_df)
+    rownames(zph_df) <- NULL
+    zph_df <- cbind(
+      data.frame(
+        分析类型 = analysis_name,
+        亚组类型 = "抑郁变化(单独)",
+        亚组名称 = "全样本",
+        分层 = layer_name,
+        调整模型 = layer_name,
+        有效样本量 = nrow(model_data),
+        事件数 = event_cnt,
+        stringsAsFactors = FALSE
+      ),
+      zph_df[, c("variable", "chisq", "df", "p")]
+    )
+    names(zph_df)[names(zph_df) == "chisq"] <- "卡方值"
+    names(zph_df)[names(zph_df) == "df"] <- "自由度"
+    names(zph_df)[names(zph_df) == "p"] <- "P值"
+    zph_df$是否满足PH假设 <- ifelse(zph_df$P值 > 0.05, "是", "否")
+    global_ph_list <<- append(global_ph_list, list(zph_df))
+    
+    # 确定违反PH的变量
+    violate_vars <- get_violate_vars(zph, all_model_vars)
+    cat("违反PH的变量:", paste(violate_vars, collapse = ", "), "\n")
+    
+    # 构建时变模型
+    main_terms <- c(ind_var, covariates)
+    inter_terms <- c()
+    for (vv in violate_vars) {
+      inter_terms <- c(inter_terms, paste0(safe_var(vv), ":time_centered"))
+    }
+    all_terms <- c(sapply(main_terms, safe_var), inter_terms)
+    formula_tv <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ ", 
+                                   paste(all_terms, collapse = " + ")))
+    
+    fit_tv <- tryCatch(coxph(formula_tv, data = model_data), error = function(e) NULL)
+    if (is.null(fit_tv)) {
+      cat("时变模型拟合失败，跳过该层\n")
+      next
+    }
+    
+    # 提取主效应结果（抑郁变量各水平）
+    s_tv <- summary(fit_tv)
+    coef_mat <- s_tv$coefficients
+    main_rows <- list()
+    # 参考组
+    main_rows <- append(main_rows, list(data.frame(
+      分层 = layer_name,
+      变量 = paste0(depression_subgroup_labels["1"], "(编码1) (参考组)"),
+      HR = "1.000",
+      HR_95CI_下限 = "-",
+      HR_95CI_上限 = "-",
+      HR_95CI = "-",
+      P值 = "-",
+      显著性 = "-",
+      系数 = "-",
+      标准误 = "-",
+      stringsAsFactors = FALSE
+    )))
+    # 其他水平
+    levs <- levels(data[[ind_var]])[-1]
+    for (lev in levs) {
+      term <- paste0(ind_var, lev)
+      if (term %in% rownames(coef_mat)) {
+        idx <- which(rownames(coef_mat) == term)
+        coef <- coef_mat[idx, "coef"]
+        se <- coef_mat[idx, "se(coef)"]
+        p <- coef_mat[idx, "Pr(>|z|)"]
+        hr <- exp(coef)
+        ci_l <- exp(coef - 1.96 * se)
+        ci_u <- exp(coef + 1.96 * se)
+        sig <- ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "")))
+        # 转换为字符型
+        main_rows <- append(main_rows, list(data.frame(
+          分层 = layer_name,
+          变量 = paste0(lev, " vs 持续无抑郁"),
+          HR = as.character(round(hr, 3)),
+          HR_95CI_下限 = as.character(round(ci_l, 3)),
+          HR_95CI_上限 = as.character(round(ci_u, 3)),
+          HR_95CI = paste0(round(ci_l, 3), "-", round(ci_u, 3)),
+          P值 = as.character(round(p, 4)),
+          显著性 = sig,
+          系数 = as.character(round(coef, 4)),
+          标准误 = as.character(round(se, 4)),
+          stringsAsFactors = FALSE
+        )))
+      }
+    }
+    if (length(main_rows) > 0) {
+      main_df <- bind_rows(main_rows)
+      main_df <- cbind(
+        data.frame(
+          分析类型 = analysis_name,
+          亚组类型 = "抑郁变化(单独)",
+          亚组名称 = "全样本",
+          分层 = layer_name,
+          调整模型 = layer_name,
+          有效样本量 = nrow(model_data),
+          事件数 = event_cnt,
+          stringsAsFactors = FALSE
+        ),
+        main_df
+      )
+      global_main_list <<- append(global_main_list, list(main_df))
+    }
+    
+    # 提取交互项结果
+    inter_rows <- list()
+    inter_terms_in_model <- grep(":time_centered", rownames(coef_mat), value = TRUE)
+    for (iterm in inter_terms_in_model) {
+      idx <- which(rownames(coef_mat) == iterm)
+      coef <- coef_mat[idx, "coef"]
+      se <- coef_mat[idx, "se(coef)"]
+      p <- coef_mat[idx, "Pr(>|z|)"]
+      hr <- exp(coef)
+      ci_l <- exp(coef - 1.96 * se)
+      ci_u <- exp(coef + 1.96 * se)
+      sig <- ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "")))
+      var_show <- gsub(":time_centered", "", iterm)
+      var_show <- gsub("^`|`$", "", var_show)
+      # 转换为字符型
+      inter_rows <- append(inter_rows, list(data.frame(
+        分层 = layer_name,
+        变量 = paste0(var_show, " × 时间(中心化)"),
+        HR = as.character(round(hr, 3)),
+        HR_95CI_下限 = as.character(round(ci_l, 3)),
+        HR_95CI_上限 = as.character(round(ci_u, 3)),
+        HR_95CI = paste0(round(ci_l, 3), "-", round(ci_u, 3)),
+        P值 = as.character(round(p, 4)),
+        显著性 = sig,
+        系数 = as.character(round(coef, 4)),
+        标准误 = as.character(round(se, 4)),
+        stringsAsFactors = FALSE
+      )))
+    }
+    if (length(inter_rows) > 0) {
+      inter_df <- bind_rows(inter_rows)
+      inter_df <- cbind(
+        data.frame(
+          分析类型 = analysis_name,
+          亚组类型 = "抑郁变化(单独)",
+          亚组名称 = "全样本",
+          分层 = layer_name,
+          调整模型 = layer_name,
+          有效样本量 = nrow(model_data),
+          事件数 = event_cnt,
+          stringsAsFactors = FALSE
+        ),
+        inter_df
+      )
+      global_interaction_list <<- append(global_interaction_list, list(inter_df))
+    }
+  } # 结束层循环
+}
+
+# =============================================================================
+# 函数3：Grip strength changes 连续变量 + CVD 时变系数 COX（整体 + 抑郁亚组）
+# =============================================================================
+run_tvcox_continuous_subgroup <- function(ind_var, event_var, time_var, dep_code = NULL) {
+  # 分析名称
+  if (is.null(dep_code)) {
+    analysis_name <- "整体分析_连续握力"
+    subgroup_type <- "抑郁变化"
+    subgroup_name <- "整体"
+  } else {
+    dep_label <- depression_subgroup_labels[as.character(dep_code)]
+    analysis_name <- paste0("抑郁亚组", dep_code, "（", dep_label, "）_连续握力")
+    subgroup_type <- "抑郁变化"
+    subgroup_name <- dep_label
+  }
+  
+  analysis_tag_raw <- paste0(analysis_name, "_", ind_var, "_连续_vs_", event_var)
+  analysis_tag <- safe_filename(analysis_tag_raw)
+  
+  cat("\n", rep("#", 80), "\n")
+  cat("开始时变COX分析（连续变量）:", analysis_name, "\n")
+  cat("自变量=", ind_var, "(连续), 事件=", event_var, ", 时间=", time_var, "\n")
+  cat(rep("#", 80), "\n")
+  
+  base_info <- list(
+    分析类型 = analysis_name,
+    亚组类型 = subgroup_type,
+    亚组名称 = subgroup_name,
+    自变量 = paste0(ind_var, "_连续"),
+    因变量 = event_var,
+    时间变量 = time_var
+  )
+  
+  # 准备数据
+  all_vars <- c(ind_var, time_var, event_var, depression_ind_var, layer2_covariates)
+  model_data <- data[, all_vars, drop = FALSE]
+  
+  # 抑郁亚组筛选
+  if (!is.null(dep_code)) {
+    model_data <- model_data[model_data[[depression_ind_var]] == depression_subgroup_labels[as.character(dep_code)], ]
+    cat("亚组筛选:", subgroup_name, "，样本量=", nrow(model_data), "\n")
+  } else {
+    cat("整体分析样本量:", nrow(model_data), "\n")
+  }
+  
+  # 删除缺失值
+  model_data <- na.omit(model_data)
+  cat("删除缺失值后有效样本量:", nrow(model_data), "\n")
+  
+  if (nrow(model_data) == 0) {
+    cat("⚠️ 有效样本量为0，跳过该分析\n")
+    return(NULL)
+  }
+  
+  event_cnt <- sum(model_data[[event_var]])
+  ev_rate <- event_cnt / nrow(model_data) * 100
+  cat("事件数:", event_cnt, "(", round(ev_rate, 1), "%)\n")
+  
+  # 时间中心化（用于交互项）
+  time_mean <- mean(model_data[[time_var]], na.rm = TRUE)
+  model_data$time_centered <- model_data[[time_var]] - time_mean
+  
+  # 连续变量描述性统计（仅输出到控制台，不存入描述表）
+  cat("\n连续变量", ind_var, "描述:\n")
+  print(summary(model_data[[ind_var]]))
+  
+  # 遍历每一层
+  for (layer_name in names(layers)) {
+    covariates <- layers[[layer_name]]
+    cat("\n【", layer_name, "】\n")
+    
+    # 构建标准模型公式（用于PH检验）
+    if (length(covariates) > 0) {
+      cov_part <- paste(sapply(covariates, safe_var), collapse = " + ")
+      formula_std <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ ", safe_var(ind_var), " + ", cov_part))
+    } else {
+      formula_std <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ ", safe_var(ind_var)))
+    }
+    
+    # 拟合标准模型
+    fit_std <- tryCatch(coxph(formula_std, data = model_data), error = function(e) NULL)
+    if (is.null(fit_std)) {
+      cat("标准模型拟合失败，跳过该层\n")
+      next
+    }
+    
+    # ---------- PH 检验 ----------
+    zph <- cox.zph(fit_std)
+    # 保存PH检验结果
+    zph_df <- as.data.frame(zph$table)
+    zph_df$variable <- rownames(zph_df)
+    rownames(zph_df) <- NULL
+    zph_df <- cbind(
+      data.frame(
+        分析类型 = analysis_name,
+        亚组类型 = subgroup_type,
+        亚组名称 = subgroup_name,
+        分层 = layer_name,
+        调整模型 = layer_name,
+        有效样本量 = nrow(model_data),
+        事件数 = event_cnt,
+        stringsAsFactors = FALSE
+      ),
+      zph_df[, c("variable", "chisq", "df", "p")]
+    )
+    names(zph_df)[names(zph_df) == "chisq"] <- "卡方值"
+    names(zph_df)[names(zph_df) == "df"] <- "自由度"
+    names(zph_df)[names(zph_df) == "p"] <- "P值"
+    zph_df$是否满足PH假设 <- ifelse(zph_df$P值 > 0.05, "是", "否")
+    global_ph_list <<- append(global_ph_list, list(zph_df))
+    
+    # 确定需要加交互项的变量
+    violate_vars <- get_violate_vars(zph, all_model_vars)
+    cat("违反PH的变量:", paste(violate_vars, collapse = ", "), "\n")
+    
+    # ---------- 构建时变模型 ----------
+    # 主效应部分：连续变量 + 协变量
+    main_terms <- c(ind_var, covariates)
+    # 交互项部分：对每个违反的变量添加 :time_centered
+    inter_terms <- c()
+    for (vv in violate_vars) {
+      inter_terms <- c(inter_terms, paste0(safe_var(vv), ":time_centered"))
+    }
+    
+    all_terms <- c(sapply(main_terms, safe_var), inter_terms)
+    formula_tv <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ ", 
+                                   paste(all_terms, collapse = " + ")))
+    
+    fit_tv <- tryCatch(coxph(formula_tv, data = model_data), error = function(e) NULL)
+    if (is.null(fit_tv)) {
+      cat("时变模型拟合失败，跳过该层\n")
+      next
+    }
+    
+    # ---------- 提取主效应结果（连续变量） ----------
+    s_tv <- summary(fit_tv)
+    coef_mat <- s_tv$coefficients
+    
+    # 提取连续变量的主效应（不含交互项的行）
+    main_rows <- list()
+    # 变量名可能包含反引号，需要匹配原始变量名
+    var_pattern <- paste0("^", safe_var(ind_var), "$")
+    idx_var <- grep(var_pattern, rownames(coef_mat))
+    if (length(idx_var) == 1) {
+      coef <- coef_mat[idx_var, "coef"]
+      se <- coef_mat[idx_var, "se(coef)"]
+      p <- coef_mat[idx_var, "Pr(>|z|)"]
+      hr <- exp(coef)
+      ci_l <- exp(coef - 1.96 * se)
+      ci_u <- exp(coef + 1.96 * se)
+      sig <- ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "")))
+      
+      main_rows <- append(main_rows, list(data.frame(
+        分层 = layer_name,
+        变量 = paste0(ind_var, " (每单位增加)"),
+        HR = as.character(round(hr, 3)),
+        HR_95CI_下限 = as.character(round(ci_l, 3)),
+        HR_95CI_上限 = as.character(round(ci_u, 3)),
+        HR_95CI = paste0(round(ci_l, 3), "-", round(ci_u, 3)),
+        P值 = as.character(round(p, 4)),
+        显著性 = sig,
+        系数 = as.character(round(coef, 4)),
+        标准误 = as.character(round(se, 4)),
+        stringsAsFactors = FALSE
+      )))
+    } else {
+      cat("警告：未找到连续变量主效应，可能模型未包含该变量。\n")
+    }
+    
+    # 添加基础信息并存入全局
+    if (length(main_rows) > 0) {
+      main_df <- bind_rows(main_rows)
+      main_df <- cbind(
+        data.frame(
+          分析类型 = analysis_name,
+          亚组类型 = subgroup_type,
+          亚组名称 = subgroup_name,
+          分层 = layer_name,
+          调整模型 = layer_name,
+          有效样本量 = nrow(model_data),
+          事件数 = event_cnt,
+          stringsAsFactors = FALSE
+        ),
+        main_df
+      )
+      global_main_list <<- append(global_main_list, list(main_df))
+    }
+    
+    # ---------- 提取交互项结果 ----------
+    inter_rows <- list()
+    inter_terms_in_model <- grep(":time_centered", rownames(coef_mat), value = TRUE)
+    for (iterm in inter_terms_in_model) {
+      idx <- which(rownames(coef_mat) == iterm)
+      coef <- coef_mat[idx, "coef"]
+      se <- coef_mat[idx, "se(coef)"]
+      p <- coef_mat[idx, "Pr(>|z|)"]
+      hr <- exp(coef)
+      ci_l <- exp(coef - 1.96 * se)
+      ci_u <- exp(coef + 1.96 * se)
+      sig <- ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "")))
+      # 变量名美化
+      var_show <- gsub(":time_centered", "", iterm)
+      var_show <- gsub("^`|`$", "", var_show)
+      
+      inter_rows <- append(inter_rows, list(data.frame(
+        分层 = layer_name,
+        变量 = paste0(var_show, " × 时间(中心化)"),
+        HR = as.character(round(hr, 3)),
+        HR_95CI_下限 = as.character(round(ci_l, 3)),
+        HR_95CI_上限 = as.character(round(ci_u, 3)),
+        HR_95CI = paste0(round(ci_l, 3), "-", round(ci_u, 3)),
+        P值 = as.character(round(p, 4)),
+        显著性 = sig,
+        系数 = as.character(round(coef, 4)),
+        标准误 = as.character(round(se, 4)),
+        stringsAsFactors = FALSE
+      )))
+    }
+    if (length(inter_rows) > 0) {
+      inter_df <- bind_rows(inter_rows)
+      inter_df <- cbind(
+        data.frame(
+          分析类型 = analysis_name,
+          亚组类型 = subgroup_type,
+          亚组名称 = subgroup_name,
+          分层 = layer_name,
+          调整模型 = layer_name,
+          有效样本量 = nrow(model_data),
+          事件数 = event_cnt,
+          stringsAsFactors = FALSE
+        ),
+        inter_df
+      )
+      global_interaction_list <<- append(global_interaction_list, list(inter_df))
+    }
+  } # 结束层循环
+}
+
+# =============================================================================
+# 7. 执行分析
+# =============================================================================
+cat("\n", rep("=", 80), "\n")
+cat("开始执行时变COX分析（整体+抑郁亚组+抑郁单独分析+连续握力）\n")
+cat(rep("=", 80), "\n")
+
+analysis_summary <- list()
+
+# 7.1 整体握力四分位数分析
+cat("\n【第一步：整体握力四分位数分析】\n")
+run_tvcox_analysis_subgroup(independent_vars, event_var, time_var, dep_code = NULL)
+
+# 7.2 抑郁四分类亚组（握力四分位数）
+cat("\n【第二步：抑郁亚组握力四分位数分析】\n")
+for (dep_code in depression_subgroups) {
+  dep_label <- depression_subgroup_labels[as.character(dep_code)]
+  cat("\n正在执行", dep_label, "（编码", dep_code, "）亚组分析...\n")
+  run_tvcox_analysis_subgroup(independent_vars, event_var, time_var, dep_code = dep_code)
+}
+
+# 7.3 抑郁变化单独分析（四分类）
+cat("\n【第三步：Depression change单独COX分析】\n")
+run_tvcox_depression_single(depression_ind_var, event_var, time_var)
+
+# 7.4 整体连续握力分析
+cat("\n【第四步：整体连续握力分析】\n")
+run_tvcox_continuous_subgroup(independent_vars, event_var, time_var, dep_code = NULL)
+
+# 7.5 抑郁亚组连续握力分析
+cat("\n【第五步：抑郁亚组连续握力分析】\n")
+for (dep_code in depression_subgroups) {
+  dep_label <- depression_subgroup_labels[as.character(dep_code)]
+  cat("\n正在执行", dep_label, "（编码", dep_code, "）亚组连续握力分析...\n")
+  run_tvcox_continuous_subgroup(independent_vars, event_var, time_var, dep_code = dep_code)
+}
+
+# =============================================================================
+# 8. 保存全局结果
+# =============================================================================
+# 8.1 主效应表
+if (length(global_main_list) > 0) {
+  main_all <- bind_rows(global_main_list)
+  main_path <- file.path(result_dir, "【全局整合】所有分析_主效应表.xlsx")
+  write.xlsx(main_all, main_path, rowNames = FALSE)
+  cat("\n✅ 全局主效应表已保存至:", basename(main_path), "\n")
+}
+
+# 8.2 交互项表
+if (length(global_interaction_list) > 0) {
+  inter_all <- bind_rows(global_interaction_list)
+  inter_path <- file.path(result_dir, "【全局整合】所有分析_交互项表.xlsx")
+  write.xlsx(inter_all, inter_path, rowNames = FALSE)
+  cat("\n✅ 全局交互项表已保存至:", basename(inter_path), "\n")
+}
+
+# 8.3 PH检验结果表
+if (length(global_ph_list) > 0) {
+  ph_all <- bind_rows(global_ph_list)
+  ph_all <- ph_all[, c("分析类型", "亚组类型", "亚组名称", "分层", "调整模型", 
+                       "有效样本量", "事件数", "variable", "卡方值", "自由度", "P值", "是否满足PH假设")]
+  names(ph_all)[names(ph_all) == "variable"] <- "变量"
+  ph_path <- file.path(result_dir, "【补充材料】PH假设检验结果表.xlsx")
+  write.xlsx(ph_all, ph_path, rowNames = FALSE)
+  cat("\n✅ PH假设检验结果表已保存至:", basename(ph_path), "\n")
+}
+
+# =============================================================================
+# 9. 多重比较校正（Bonferroni & FDR）——抑郁亚组内握力四分位数比较
+# =============================================================================
+cat("\n", rep("=", 60), "\n")
+cat("开始进行多重比较校正（Bonferroni & FDR）...\n")
+
+if (exists("main_all") && nrow(main_all) > 0) {
+  
+  # 筛选出抑郁亚组分析的行（分析类型包含“抑郁亚组”）
+  sub_main <- main_all[grepl("抑郁亚组", main_all$分析类型), ]
+  
+  if (nrow(sub_main) > 0) {
+    
+    # 将P值从字符转换为数值（处理可能的 "<0.001" 格式）
+    p_values <- sub_main$P值
+    # 若包含 "<0.001" 这样的符号，需解析
+    p_numeric <- ifelse(grepl("<", p_values), 
+                        0.001, 
+                        as.numeric(p_values))
+    # 若转换后仍有 NA，则保留原值（一般不会）
+    p_numeric[is.na(p_numeric) & !is.na(p_values)] <- 1
+    
+    sub_main$P值_原始 <- p_values  # 保留原始字符型P值
+    sub_main$P值_数值 <- p_numeric
+    
+    # 按亚组分组进行Bonferroni校正
+    sub_main <- sub_main %>%
+      group_by(亚组名称) %>%
+      mutate(
+        比较次数 = n(),  # 每个亚组内的比较次数（通常是3，但保险起见动态计算）
+        P值_Bonferroni = pmin(P值_数值 * 比较次数, 1),  # 校正后P值不超过1
+        显著性_Bonferroni = case_when(
+          P值_Bonferroni < 0.001 ~ "***",
+          P值_Bonferroni < 0.01  ~ "**",
+          P值_Bonferroni < 0.05  ~ "*",
+          TRUE                    ~ ""
+        )
+      ) %>%
+      ungroup()
+    
+    # 按亚组分组进行FDR校正（Benjamini-Hochberg）
+    sub_main <- sub_main %>%
+      group_by(亚组名称) %>%
+      mutate(
+        P值_FDR = p.adjust(P值_数值, method = "fdr"),  # FDR校正
+        显著性_FDR = case_when(
+          P值_FDR < 0.001 ~ "***",
+          P值_FDR < 0.01  ~ "**",
+          P值_FDR < 0.05  ~ "*",
+          TRUE             ~ ""
+        )
+      ) %>%
+      ungroup()
+    
+    # 生成报告表格（包含原始、Bonferroni、FDR）
+    report_cols <- c("分析类型", "亚组名称", "分层", "调整模型", "变量", 
+                     "HR", "HR_95CI", "P值_原始", 
+                     "P值_Bonferroni", "显著性_Bonferroni",
+                     "P值_FDR", "显著性_FDR")
+    report_df <- sub_main[, intersect(report_cols, names(sub_main))]
+    
+    # 保存到Excel（作为补充材料）
+    bonferroni_path <- file.path(result_dir, "【补充材料】主效应表_多重比较校正.xlsx")
+    write.xlsx(report_df, bonferroni_path, rowNames = FALSE)
+    
+    cat("✅ 多重比较校正完成！校正后的结果已保存至:", basename(bonferroni_path), "\n")
+    cat("  校正说明：每个抑郁亚组内，对 Q2、Q3、Q4 与 Q1 的比较进行了Bonferroni和FDR校正。\n")
+    
+  } else {
+    cat("⚠️ 未找到抑郁亚组分析的结果，无法进行校正。\n")
+  }
+} else {
+  cat("⚠️ 主效应表不存在，无法进行校正。\n")
+}
+
+cat(rep("=", 60), "\n")
+
+# =============================================================================
+# 10. 新增功能：加法交互作用检验（RERI, AP, S）
+# =============================================================================
+cat("\n", rep("=", 60), "\n")
+cat("开始进行加法交互作用检验（RERI/AP/S）...\n")
+
+# 10.1 创建二分类变量
+# 握力变化：Q1（最严重下降）为“下降组”=1，Q2-Q4为“非下降组”=0
+data$grip_bin <- ifelse(data$grip_quartile == "Q1", 1, 0)
+
+# 抑郁状态：持续抑郁 + 新发抑郁 = “有抑郁”=1；持续无抑郁 + 抑郁缓解 = “无抑郁”=0
+data$dep_bin <- ifelse(data[[depression_ind_var]] %in% c("持续抑郁", "新发抑郁"), 1, 0)
+
+# 10.2 构建四分类联合变量 (0-3)
+data$joint <- factor(ifelse(data$grip_bin == 0 & data$dep_bin == 0, 0,
+                            ifelse(data$grip_bin == 1 & data$dep_bin == 0, 1,
+                                   ifelse(data$grip_bin == 0 & data$dep_bin == 1, 2, 3))))
+# 设置参考组为0
+data$joint <- relevel(data$joint, ref = "0")
+
+# 检查各组合的样本量
+cat("\n四分类联合变量分布：\n")
+print(table(data$joint))
+
+# 10.3 拟合完全调整的Cox模型（使用第二层协变量）
+covariates <- layers[["第二层(完全调整)"]]
+cov_part <- paste(sapply(covariates, safe_var), collapse = " + ")
+formula_add <- as.formula(paste("Surv(", time_var, ", ", event_var, ") ~ joint +", cov_part))
+fit_add <- coxph(formula_add, data = data)
+
+# 提取HR点估计
+summary_fit <- summary(fit_add)
+coef_mat <- coef(summary_fit)
+# 注意：joint1, joint2, joint3 的顺序取决于因子水平，通常joint1对应(1,0), joint2对应(0,1), joint3对应(1,1)
+# 可以通过 levels(data$joint) 确认
+levels_joint <- levels(data$joint)
+cat("\n联合变量水平：", paste(levels_joint, collapse = ", "), "\n")
+# 假设顺序为 0,1,2,3，则 joint1对应grip_bin=1,dep_bin=0；joint2对应grip_bin=0,dep_bin=1；joint3对应grip_bin=1,dep_bin=1
+idx1 <- which(rownames(coef_mat) == "joint1")
+idx2 <- which(rownames(coef_mat) == "joint2")
+idx3 <- which(rownames(coef_mat) == "joint3")
+if (length(c(idx1, idx2, idx3)) == 3) {
+  HR10 <- exp(coef_mat[idx1, "coef"])
+  HR01 <- exp(coef_mat[idx2, "coef"])
+  HR11 <- exp(coef_mat[idx3, "coef"])
+  
+  cat("\n点估计值：\n")
+  cat("HR10 (Grip下降, 无抑郁):", round(HR10, 3), "\n")
+  cat("HR01 (无下降, 有抑郁):", round(HR01, 3), "\n")
+  cat("HR11 (Grip下降, 有抑郁):", round(HR11, 3), "\n")
+} else {
+  stop("未能正确识别joint1/joint2/joint3的系数，请检查模型输出。")
+}
+
+# 10.4 Bootstrap计算RERI, AP, S的置信区间
+# 定义bootstrap统计量函数
+boot_add <- function(data, indices) {
+  d <- data[indices, ]  # 重抽样样本
+  # 重新拟合模型
+  fit_boot <- tryCatch(coxph(formula_add, data = d), error = function(e) NULL)
+  if (is.null(fit_boot)) return(rep(NA, 3))
+  
+  s_boot <- summary(fit_boot)
+  coef_boot <- coef(s_boot)
+  
+  # 提取系数
+  idx1 <- which(rownames(coef_boot) == "joint1")
+  idx2 <- which(rownames(coef_boot) == "joint2")
+  idx3 <- which(rownames(coef_boot) == "joint3")
+  if (length(c(idx1, idx2, idx3)) != 3) return(rep(NA, 3))
+  
+  HR10_boot <- exp(coef_boot[idx1, "coef"])
+  HR01_boot <- exp(coef_boot[idx2, "coef"])
+  HR11_boot <- exp(coef_boot[idx3, "coef"])
+  
+  RERI <- HR11_boot - HR10_boot - HR01_boot + 1
+  AP   <- RERI / HR11_boot
+  S    <- (HR11_boot - 1) / ((HR10_boot - 1) + (HR01_boot - 1))
+  
+  return(c(RERI, AP, S))
+}
+
+# 设置随机种子以便结果可重复
+set.seed(20260226)
+cat("\n正在进行Bootstrap（1000次），请稍候...\n")
+boot_results <- boot(data = data, statistic = boot_add, R = 1000)
+
+# 提取有效结果（排除NA）
+valid_reri <- boot_results$t[,1][!is.na(boot_results$t[,1])]
+valid_ap   <- boot_results$t[,2][!is.na(boot_results$t[,2])]
+valid_s    <- boot_results$t[,3][!is.na(boot_results$t[,3])]
+
+if (length(valid_reri) < 100) {
+  cat("⚠️ Bootstrap有效样本较少，结果可能不稳定。\n")
+}
+
+# 计算95%置信区间（百分位法）
+ci_reri <- quantile(valid_reri, probs = c(0.025, 0.975), na.rm = TRUE)
+ci_ap   <- quantile(valid_ap, probs = c(0.025, 0.975), na.rm = TRUE)
+ci_s    <- quantile(valid_s, probs = c(0.025, 0.975), na.rm = TRUE)
+
+# 10.5 输出结果
+cat("\n", rep("=", 60), "\n")
+cat("加法交互作用检验结果\n")
+cat(rep("=", 60), "\n")
+cat("RERI =", round(boot_results$t0[1], 3), 
+    "（95% CI:", round(ci_reri[1], 3), "-", round(ci_reri[2], 3), "）\n")
+cat("AP   =", round(boot_results$t0[2], 3), 
+    "（95% CI:", round(ci_ap[1], 3), "-", round(ci_ap[2], 3), "）\n")
+cat("S    =", round(boot_results$t0[3], 3), 
+    "（95% CI:", round(ci_s[1], 3), "-", round(ci_s[2], 3), "）\n")
+cat(rep("=", 60), "\n")
+
+# 10.6 保存结果到Excel
+add_result_dir <- file.path(result_dir, "加法交互作用检验")
+dir.create(add_result_dir, showWarnings = FALSE)
+
+# 整理输出表格
+add_df <- data.frame(
+  指标 = c("RERI", "AP", "S"),
+  点估计 = round(boot_results$t0, 3),
+  CI_下限 = c(round(ci_reri[1], 3), round(ci_ap[1], 3), round(ci_s[1], 3)),
+  CI_上限 = c(round(ci_reri[2], 3), round(ci_ap[2], 3), round(ci_s[2], 3))
+)
+add_df$CI_95 <- paste0(add_df$CI_下限, "-", add_df$CI_上限)
+
+write.xlsx(add_df, file = file.path(add_result_dir, "加法交互作用_RERI_AP_S.xlsx"), rowNames = FALSE)
+
+cat("\n✅ 加法交互作用检验结果已保存至:", file.path(add_result_dir, "加法交互作用_RERI_AP_S.xlsx"), "\n")
+
+# =============================================================================
+# 11. 输出各模型暴露组描述性统计表（新增功能）
+# =============================================================================
+cat("\n", rep("=", 60), "\n")
+cat("开始输出各模型暴露组描述性统计表...\n")
+
+if (length(global_desc_list) > 0) {
+  desc_all <- bind_rows(global_desc_list)
+  # 调整列顺序
+  desc_all <- desc_all[, c("分析类型", "亚组类型", "亚组名称", "分层", "调整模型", 
+                           "变量水平", "样本量", "事件数", "事件率")]
+  desc_path <- file.path(result_dir, "【描述统计】各模型暴露组样本量与事件数.xlsx")
+  write.xlsx(desc_all, desc_path, rowNames = FALSE)
+  cat("✅ 描述性统计表已保存至:", basename(desc_path), "\n")
+} else {
+  cat("⚠️ 无描述性统计结果可输出。\n")
+}
+
+cat(rep("=", 60), "\n")
+
+# =============================================================================
+# 12. 完成提示
+# =============================================================================
+cat("\n", rep("#", 80), "\n")
+cat("🎉 时变COX分析完成！结果目录:", result_dir, "\n")
+cat("核心功能确认：\n")
+cat(" • 所有亚组均使用“全样本四分位数(Q1-Q4)”并以 Q1 为参考\n")
+cat(" • 新增连续握力变量分析（整体 + 抑郁亚组）\n")
+cat(" • 对每个模型进行了PH检验，并对违反PH的变量自动添加时间交互项\n")
+cat(" • 输出文件包括：主效应表、交互项表、PH检验结果表\n")
+cat(" • 新增：抑郁亚组内多重比较校正（Bonferroni & FDR）结果表\n")
+cat(" • 新增：加法交互作用检验（RERI/AP/S）结果表\n")
+cat(" • 新增：各模型暴露组样本量与事件数描述性统计表\n")
+cat(rep("#", 80), "\n")

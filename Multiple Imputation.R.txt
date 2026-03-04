@@ -1,0 +1,189 @@
+# ==========================================================================
+# 多重插补与诊断（R 版本）—— 修正版
+# 针对奇异性错误，修改了预测矩阵，排除 ID 等不应作为预测变量的列。
+# ==========================================================================
+
+# -------------------- 检查并加载必需包 --------------------
+required_packages <- c("mice", "readxl", "writexl", "dplyr", "tidyr")
+missing_packages <- required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
+
+if (length(missing_packages) > 0) {
+  cat("缺少以下 R 包：", paste(missing_packages, collapse = ", "), "\n")
+  cat("请运行：install.packages(c('", paste(missing_packages, collapse = "', '"), "'))\n", sep = "")
+  stop("请安装所需包后重新运行脚本。")
+}
+
+# 加载包
+library(mice)
+library(readxl)
+library(writexl)
+library(dplyr)
+library(tidyr)
+
+# -------------------- 用户路径设置 --------------------
+input_path  <- "D:/中老年抑郁患者握力变化与心血管疾病的关联/筛选数据/未处理异常值主分析/数据.xlsx"
+output_excel <- "D:/中老年抑郁患者握力变化与心血管疾病的关联/筛选数据/未处理异常值主分析/imputed_数据.xlsx"
+output_orange <- "D:/中老年抑郁患者握力变化与心血管疾病的关联/筛选数据/未处理异常值主分析/imputed_数据.tab"
+
+# -------------------- 读取数据 --------------------
+charls_data <- as.data.frame(read_excel(input_path))
+cat("原始数据形状:", dim(charls_data), "\n")
+cat("缺失值情况:\n")
+print(colSums(is.na(charls_data)))
+
+# ==================== 1. 多重插补（修正预测矩阵）====================
+cat("\n正在执行多重插补（m=5, maxit=10）...\n")
+
+# 获取初始预测矩阵
+ini <- mice(charls_data, m = 5, maxit = 0, seed = 42, print = FALSE)
+pred <- ini$predictorMatrix
+
+# 修改预测矩阵：ID 不参与预测（行和列都设为0）
+if ("ID" %in% colnames(charls_data)) {
+  pred["ID", ] <- 0   # ID 不预测其他变量
+  pred[, "ID"] <- 0   # 其他变量不预测 ID
+  cat("已从预测矩阵中排除 ID 变量。\n")
+}
+
+# 运行插补
+imp <- mice(charls_data, m = 5, maxit = 10, method = ini$method,
+            predictorMatrix = pred, seed = 42, print = FALSE)
+cat("插补完成。\n")
+
+# ==================== 2. Gelman-Rubin 收敛诊断 ====================
+cat("\n========== Gelman-Rubin 收敛诊断 ==========\n")
+# 提取 chainMean（插补值的均值）
+chain_mean_imp <- imp$chainMean  # 数组 [变量, 迭代, 链]
+
+# 计算每个变量的观测均值与缺失数量
+na_matrix <- is.na(charls_data)
+n_obs_vec <- colSums(!na_matrix)
+n_total <- nrow(charls_data)
+obs_means <- sapply(charls_data, function(x) mean(x, na.rm = TRUE))
+
+# 将 obs_means 扩展为与 chain_mean_imp 相同维度的数组
+vars <- dimnames(chain_mean_imp)[[1]]
+iterations <- dim(chain_mean_imp)[[2]]
+chains <- dim(chain_mean_imp)[[3]]
+
+# 创建数组：变量 × 迭代 × 链
+n_mis_array <- array(rep(n_total - n_obs_vec, each = iterations * chains),
+                     dim = c(length(vars), iterations, chains))
+obs_means_array <- array(rep(obs_means, each = iterations * chains),
+                         dim = c(length(vars), iterations, chains))
+
+# 总体均值 = (n_obs * obs_means + n_mis * chain_mean_imp) / n_total
+overall_means <- (n_obs_vec * obs_means_array + n_mis_array * chain_mean_imp) / n_total
+
+# Gelman-Rubin 计算函数
+gelman_rubin <- function(means_mat, burnin = 2) {
+  # means_mat: 矩阵 [迭代, 链]
+  n_iter <- nrow(means_mat)
+  n_chain <- ncol(means_mat)
+  if (n_iter <= burnin) return(NA)
+  means <- means_mat[(burnin+1):n_iter, , drop = FALSE]
+  n <- nrow(means)
+  chain_avg <- colMeans(means)
+  overall_avg <- mean(means)
+  within_var <- mean(apply(means, 2, var))
+  between_var <- n / (n_chain - 1) * sum((chain_avg - overall_avg)^2)
+  var_hat <- (1 - 1/n) * within_var + (1/n) * between_var
+  psrf <- sqrt(var_hat / within_var)
+  return(psrf)
+}
+
+# 对每个变量计算 PSRF
+psrf_values <- sapply(seq_along(vars), function(i) {
+  mat <- overall_means[i, , ]  # 迭代 × 链
+  gelman_rubin(mat, burnin = 2)
+})
+names(psrf_values) <- vars
+cat("潜在尺度缩减因子 (PSRF，<1.1 表示收敛):\n")
+print(psrf_values)
+
+# ==================== 3. 分布一致性检验 ====================
+cat("\n========== 分布一致性检验 ==========\n")
+# 获取长格式数据（包含原始和所有插补数据集）
+long <- complete(imp, "long", include = TRUE)
+
+results_list <- list()
+for (var in names(charls_data)) {
+  # 观测值（原始非缺失）
+  obs_vals <- charls_data[[var]][!is.na(charls_data[[var]])]
+  
+  # 插补值（所有插补数据集中对应缺失位置）
+  imp_vals <- long[long$.imp > 0 & is.na(charls_data[[var]]), var]
+  
+  if (length(imp_vals) == 0) next  # 无缺失则跳过
+  
+  # 判断变量类型
+  if (is.numeric(charls_data[[var]])) {
+    unique_vals <- unique(obs_vals)
+    if (length(unique_vals) == 2 && all(unique_vals %% 1 == 0)) {
+      var_type <- "binary"
+    } else {
+      var_type <- "continuous"
+    }
+  } else {
+    if (length(unique(obs_vals)) == 2) {
+      var_type <- "binary"
+    } else {
+      cat("变量", var, "为多分类，当前仅处理二分类，跳过检验。\n")
+      next
+    }
+  }
+  
+  if (var_type == "continuous") {
+    ks <- ks.test(obs_vals, imp_vals)
+    results_list[[var]] <- data.frame(
+      Variable = var,
+      Type = "Continuous",
+      Test = "KS",
+      Statistic = ks$statistic,
+      P_value = ks$p.value,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    # 二分类卡方检验
+    obs_tab <- table(obs_vals)
+    imp_tab <- table(imp_vals)
+    all_cats <- union(names(obs_tab), names(imp_tab))
+    obs_counts <- as.numeric(obs_tab[match(all_cats, names(obs_tab))])
+    obs_counts[is.na(obs_counts)] <- 0
+    imp_counts <- as.numeric(imp_tab[match(all_cats, names(imp_tab))])
+    imp_counts[is.na(imp_counts)] <- 0
+    contingency <- cbind(Observed = obs_counts, Imputed = imp_counts)
+    chi <- chisq.test(contingency, correct = FALSE)
+    results_list[[var]] <- data.frame(
+      Variable = var,
+      Type = "Binary",
+      Test = "Chi-square",
+      Statistic = chi$statistic,
+      P_value = chi$p.value,
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+if (length(results_list) > 0) {
+  dist_results <- do.call(rbind, results_list)
+  print(dist_results, row.names = FALSE)
+} else {
+  cat("没有变量进行检验。\n")
+}
+
+# ==================== 4. 导出第一个插补数据集 ====================
+imputed_data <- complete(imp, action = 1)
+cat("\n插补后缺失值情况:\n")
+print(colSums(is.na(imputed_data)))
+
+# 导出 Excel
+write_xlsx(imputed_data, path = output_excel)
+cat("填补好的数据已成功导出到:", output_excel, "\n")
+
+# 导出 Orange 格式（制表符分隔）
+write.table(imputed_data, file = output_orange, sep = "\t",
+            row.names = FALSE, quote = FALSE)
+cat("Orange格式数据已保存至:", output_orange, "\n")
+
+cat("\n========== 全部完成 ==========\n")

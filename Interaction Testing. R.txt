@@ -1,0 +1,264 @@
+# ==============================================================================
+# 1. 加载必需包（若未安装，先执行 install.packages(c("包名")) ）
+# ==============================================================================
+library(survival)   # COX回归核心包
+library(dplyr)      # 数据处理
+library(openxlsx)   # 结果保存（兼容中文）
+library(readxl)     # 读取Excel数据（若数据是csv，用read.csv）
+
+# ==============================================================================
+# 2. 设置数据路径与读取数据（适配中文路径+空格）
+# ==============================================================================
+# 数据存储主路径（复制你的路径，注意转义符\\）
+main_path <- "D:\\中老年抑郁患者握力变化与心血管疾病的关联\\筛选数据\\未处理异常值主分析"
+
+# 数据文件名（根据实际格式选择：xlsx或csv）
+data_file <- "插补后数据.xlsx"  # 若为csv，改为 "插补后数据.csv"
+
+# 读取数据（处理中文编码和空格）
+setwd(main_path)  # 设置工作路径
+# 情况1：数据是Excel格式（推荐）
+data <- read_excel(
+  file.path(main_path, data_file),
+  sheet = 1,  # 若数据在第1个工作表，可省略
+  col_names = TRUE  # 第一行作为列名
+)
+
+# 情况2：若数据是CSV格式，替换上面的读取代码：
+# data <- read.csv(
+#   file.path(main_path, data_file),
+#   header = TRUE,
+#   fileEncoding = "UTF-8"  # 解决中文乱码
+# )
+
+# 查看数据前5行，确认读取成功
+cat("✅ 数据读取成功，数据维度：", nrow(data), "行 ×", ncol(data), "列\n")
+head(data[, c("time", "CVD", "Grip strength changes", "Depression change")])
+
+# ==============================================================================
+# 3. 数据预处理（关键：变量名处理+因子转换+缺失值检查）
+# ==============================================================================
+# 3.1 定义核心变量名（统一处理空格，避免模型报错）
+var_def <- list(
+  time_var = "time",                # 时间变量
+  event_var = "CVD",                # 事件变量（CVD）
+  grip_var = "Grip strength changes",# 连续自变量：握力变化
+  dep_var = "Depression change",    # 分类自变量：抑郁轨迹
+  # 协变量列表（按你的要求）
+  covars = c(
+    "Baseline grip strength", "TC", "HDL-C", "HbA1c", "CRP", "SBP",
+    "Sex", "Age", "Education", "Marital status", "Smoking", "Drinking",
+    "Social activity", "Physical activity", "Height", "Weight"
+  )
+)
+
+# 3.2 因子变量转换（确保分类变量为因子类型）
+# Depression change：转为因子，参考组设为"持续无抑郁"（编码1）
+if (var_def$dep_var %in% names(data)) {
+  # 确认抑郁轨迹的水平（根据你的数据调整标签/编码）
+  dep_levels <- c("1", "2", "3", "4")  # 编码
+  dep_labels <- c("持续无抑郁", "抑郁缓解", "持续抑郁", "新发抑郁")  # 对应标签
+  data[[var_def$dep_var]] <- factor(
+    data[[var_def$dep_var]],
+    levels = dep_levels,
+    labels = dep_labels,
+    ordered = FALSE  # 无序因子
+  )
+  # 设置参考组：持续无抑郁
+  data[[var_def$dep_var]] <- relevel(data[[var_def$dep_var]], ref = "持续无抑郁")
+  cat("✅", var_def$dep_var, "已转为因子，参考组：持续无抑郁\n")
+}
+
+# 其他分类协变量转换（Sex/Education等）
+cat_vars <- c("Sex", "Education", "Marital status", "Smoking", "Drinking", 
+              "Social activity", "Physical activity")
+for (var in cat_vars) {
+  if (var %in% names(data)) {
+    data[[var]] <- factor(data[[var]], ordered = FALSE)
+    # 设为最常见水平为参考组（或按你的研究设定）
+    data[[var]] <- relevel(data[[var]], ref = names(table(data[[var]]))[1])
+    cat("✅", var, "已转为因子，参考组：", levels(data[[var]])[1], "\n")
+  }
+}
+
+# 3.3 缺失值检查（仅删除关键变量缺失，协变量缺失由模型自动处理）
+key_vars <- c(var_def$time_var, var_def$event_var, var_def$grip_var, var_def$dep_var)
+missing_key <- sum(!complete.cases(data[, key_vars]))
+if (missing_key > 0) {
+  cat("⚠️ 关键变量缺失", missing_key, "行，已删除\n")
+  data <- data[complete.cases(data[, key_vars]), ]
+}
+
+# 协变量缺失值汇总（供参考）
+covar_missing <- sapply(var_def$covars, function(x) {
+  if (x %in% names(data)) sum(is.na(data[[x]])) else NA
+})
+cat("\n=== 协变量缺失值汇总 ===\n")
+print(covar_missing)
+
+# ==============================================================================
+# 4. 构建COX模型检验交互作用（核心步骤）
+# ==============================================================================
+# 4.1 定义模型公式（处理变量名空格：用反引号`包裹）
+# 辅助函数：给有空格的变量加反引号
+safe_var <- function(x) {
+  if (grepl(" ", x) || grepl("-", x)) paste0("`", x, "`") else x
+}
+
+# 协变量部分（拼接为公式字符串）
+covar_part <- paste(sapply(var_def$covars, safe_var), collapse = " + ")
+
+# 模型1：无交互项（基础模型）
+formula_null <- as.formula(
+  paste0(
+    "Surv(", safe_var(var_def$time_var), ", ", safe_var(var_def$event_var), ") ~ ",
+    safe_var(var_def$grip_var), " + ", safe_var(var_def$dep_var), " + ",
+    covar_part
+  )
+)
+
+# 模型2：有交互项（主效应+乘积交互项）
+formula_full <- as.formula(
+  paste0(
+    "Surv(", safe_var(var_def$time_var), ", ", safe_var(var_def$event_var), ") ~ ",
+    safe_var(var_def$grip_var), " * ", safe_var(var_def$dep_var), " + ",  # * 自动包含主效应+交互项
+    covar_part
+  )
+)
+
+# 4.2 拟合模型（添加na.action=na.exclude，保留部分缺失样本）
+cat("\n=== 拟合COX模型 ===\n")
+# 基础模型（无交互）
+fit_null <- tryCatch(
+  coxph(formula_null, data = data, singular.ok = TRUE, na.action = na.exclude),
+  error = function(e) {
+    cat("❌ 基础模型拟合失败：", e$message, "\n")
+    return(NULL)
+  }
+)
+
+# 全模型（有交互）
+fit_full <- tryCatch(
+  coxph(formula_full, data = data, singular.ok = TRUE, na.action = na.exclude),
+  error = function(e) {
+    cat("❌ 全模型拟合失败：", e$message, "\n")
+    return(NULL)
+  }
+)
+
+# 4.3 似然比检验计算交互项P值（P for interaction）【修正版】
+if (!is.null(fit_null) && !is.null(fit_full)) {
+  lr_test <- anova(fit_null, fit_full)
+  # 修正：更稳健地提取P值（适配不同R版本的列名）
+  cat("=== 似然比检验结果的列名 ===\n")
+  print(colnames(lr_test))
+  
+  # 按列位置提取（最稳健，Chisq对应的P值在第4列）
+  p_interaction <- lr_test[2, 4]  
+  # 兜底：按列名匹配（兼容Pr(>Chi) / Pr(>Chisq)）
+  if (is.na(p_interaction) || !is.numeric(p_interaction)) {
+    p_col <- grep("Pr(>|Chi)", colnames(lr_test), value = TRUE)
+    p_interaction <- lr_test[2, p_col]
+  }
+  
+  cat("\n✅ 交互项似然比检验结果：\n")
+  print(lr_test)
+  cat("\n📌 核心结果：Grip strength changes × Depression change 交互项 P值 =", round(p_interaction, 4), "\n")
+  
+  # 判断交互作用是否显著
+  if (p_interaction < 0.05) {
+    cat("👉 交互作用有统计学意义（P<0.05），可进一步做亚组分析！\n")
+  } else {
+    cat("👉 交互作用无统计学意义（P≥0.05），建议报告整体关联结果！\n")
+  }
+} else {
+  cat("❌ 模型拟合失败，无法计算交互项P值\n")
+  p_interaction <- NA
+}
+
+# ==============================================================================
+# 5. 提取详细结果（交互项各水平HR/CI/P值）
+# ==============================================================================
+if (!is.null(fit_full)) {
+  cat("\n=== 交互项各水平详细结果 ===\n")
+  fit_summary <- summary(fit_full)
+  coef_mat <- fit_summary$coefficients
+  
+  # 筛选交互项行（握力×抑郁）
+  inter_terms <- grep(paste0(safe_var(var_def$grip_var), ":"), rownames(coef_mat), value = TRUE)
+  
+  # 整理结果表格
+  inter_result <- data.frame(
+    变量 = inter_terms,
+    系数 = round(coef_mat[inter_terms, "coef"], 4),
+    标准误 = round(coef_mat[inter_terms, "se(coef)"], 4),
+    HR = round(exp(coef_mat[inter_terms, "coef"]), 4),
+    HR_95CI_L = round(exp(coef_mat[inter_terms, "coef"] - 1.96 * coef_mat[inter_terms, "se(coef)"]), 4),
+    HR_95CI_U = round(exp(coef_mat[inter_terms, "coef"] + 1.96 * coef_mat[inter_terms, "se(coef)"]), 4),
+    P值 = round(coef_mat[inter_terms, "Pr(>|z|)"], 4),
+    显著性 = ifelse(coef_mat[inter_terms, "Pr(>|z|)"] < 0.001, "***",
+                 ifelse(coef_mat[inter_terms, "Pr(>|z|)"] < 0.01, "**",
+                        ifelse(coef_mat[inter_terms, "Pr(>|z|)"] < 0.05, "*", ""))),
+    stringsAsFactors = FALSE
+  )
+  
+  # 美化变量名
+  inter_result$变量 <- gsub(paste0(safe_var(var_def$grip_var), ":"), "握力变化 × ", inter_result$变量)
+  inter_result$变量 <- gsub(safe_var(var_def$dep_var), "抑郁轨迹_", inter_result$变量)
+  print(inter_result, row.names = FALSE)
+}
+
+# ==============================================================================
+# 6. 保存结果到Excel（方便论文使用）【修正核心报错】
+# ==============================================================================
+# 创建结果保存目录
+result_dir <- file.path(main_path, "交互项检验结果")
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 整理汇总结果（修正：列名用反引号包裹，调整换行格式）
+summary_result <- data.frame(
+  `分析内容` = "Grip strength changes × Depression change 交互作用检验",
+  `有效样本量` = nrow(data),
+  `事件数` = sum(data[[var_def$event_var]], na.rm = TRUE),
+  `交互项整体P值（似然比检验）` = ifelse(is.numeric(p_interaction), round(p_interaction, 4), "NA"),
+  `交互作用是否显著` = ifelse(is.numeric(p_interaction) & p_interaction < 0.05, "是", "否"),
+  `协变量调整` = paste(var_def$covars, collapse = ", "),
+  `分析时间` = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+  stringsAsFactors = FALSE
+)
+
+# 保存结果
+result_file <- file.path(result_dir, "握力-抑郁交互项检验结果.xlsx")
+wb <- createWorkbook()
+addWorksheet(wb, "汇总结果")
+writeData(wb, "汇总结果", summary_result)
+if (exists("inter_result")) {
+  addWorksheet(wb, "交互项各水平结果")
+  writeData(wb, "交互项各水平结果", inter_result)
+}
+saveWorkbook(wb, result_file, overwrite = TRUE)
+
+cat("\n🎉 分析完成！结果已保存至：", result_file, "\n")
+
+# ==============================================================================
+# 7. 额外：PH假设检验（可选，验证模型假设）
+# ==============================================================================
+if (!is.null(fit_full)) {
+  cat("\n=== PH假设检验结果 ===\n")
+  zph_test <- cox.zph(fit_full)
+  print(zph_test)
+  # 保存PH检验结果
+  zph_result <- as.data.frame(zph_test$table)
+  zph_result$变量 <- rownames(zph_result)
+  addWorksheet(wb, "PH假设检验")
+  writeData(wb, "PH假设检验", zph_result)
+  saveWorkbook(wb, result_file, overwrite = TRUE)
+  # 提示违反PH假设的变量
+  violate_ph <- rownames(zph_result)[zph_result$p < 0.05]
+  if (length(violate_ph) > 0) {
+    cat("⚠️ 以下变量违反PH假设：", paste(violate_ph, collapse = ", "), "\n")
+    cat("建议：可添加时变系数（×time）修正模型！\n")
+  } else {
+    cat("✅ 所有变量满足PH假设，模型稳健！\n")
+  }
+}
